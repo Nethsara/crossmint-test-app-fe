@@ -70,53 +70,6 @@ export function SendFundsModal({ open, onClose }: SendFundsModalProps) {
     }
   }
 
-  async function sendTransactionToCrossmint(
-    walletAddress: string,
-    serializedTransaction: string
-  ): Promise<any> {
-    const CROSSMINT_API_KEY =
-      "sk_staging_AAEF1zGAqUgJcz3jChASJnuf7AUSb81bavPmYykmWL8KvkqCnT7wbaPE3YVBCJqGs7MxBj9YsojqRH9jTHELw7w3eKydhP7PuSNHMwQMvdnk6NLuFwq5PH7vK2v5B9R6ett7kSZHywf6bMFxjjrgSic3KgkQVS7DgSuXnRF7fjf55JmUWwZEwDnRgJ9jdyu6KMMza6iw7yMWnDiFPPxGztxQ";
-    if (!CROSSMINT_API_KEY) {
-      throw new Error("CROSSMINT_API_KEY not set in environment variables");
-    }
-
-    try {
-      console.log(`Sending transaction to Crossmint for wallet: ${walletAddress}`);
-      const response = await fetch(
-        `https://staging.crossmint.com/api/2022-06-09/wallets/${walletAddress}/transactions`,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "X-API-KEY": CROSSMINT_API_KEY,
-          },
-          body: JSON.stringify({
-            params: {
-              transaction: serializedTransaction,
-              requiredSigners: [],
-            },
-          }),
-        }
-      );
-
-      console.log("response:", response);
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(
-          `Failed to send transaction to Crossmint: ${response.statusText}. Details: ${errorText}`
-        );
-      }
-
-      const data = await response.json();
-      console.log("Transaction sent to Crossmint successfully");
-      return data;
-    } catch (error) {
-      console.error("Error sending transaction to Crossmint:", error);
-      throw error;
-    }
-  }
-
   async function validateAndBroadcast(
     wrappedTxBase58: string,
     approvals: Array<{ signer: string; signature: string }>,
@@ -139,7 +92,7 @@ export function SendFundsModal({ open, onClose }: SendFundsModalProps) {
     // Build signature map from approvals
     const signaturesByPubkey: Record<string, string> = {};
     for (const approval of approvals) {
-      const pubkey = approval.signer.split(":")[1];
+      const pubkey = approval.signer;
       signaturesByPubkey[pubkey] = approval.signature;
       console.log(`Have signature for: ${pubkey}`);
     }
@@ -265,7 +218,7 @@ export function SendFundsModal({ open, onClose }: SendFundsModalProps) {
 
       const sig = [
         {
-          signer: "AVsGgtpNfpncBHwBePY81SPVredLmaoHRWq3Vn8EMJ3C",
+          signer: solanaWallet.address,
           signature: signature as string,
         },
       ];
