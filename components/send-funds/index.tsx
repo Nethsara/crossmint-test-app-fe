@@ -47,11 +47,7 @@ export function SendFundsModal({ open, onClose }: SendFundsModalProps) {
   const connection = new Connection("https://api.devnet.solana.com");
 
   const isRecipientValid = isValidAddress(recipient) || isEmail(recipient);
-  const isAmountValid =
-    !!amount &&
-    !Number.isNaN(Number(amount)) &&
-    Number(amount) > 0 &&
-    Number(amount) <= Number(displayableBalance);
+  const isAmountValid = true;
   const canContinue = isRecipientValid && isAmountValid;
 
   async function handleContinue() {
@@ -74,6 +70,138 @@ export function SendFundsModal({ open, onClose }: SendFundsModalProps) {
     }
   }
 
+  async function sendTransactionToCrossmint(
+    walletAddress: string,
+    serializedTransaction: string
+  ): Promise<any> {
+    const CROSSMINT_API_KEY =
+      "sk_staging_AAEF1zGAqUgJcz3jChASJnuf7AUSb81bavPmYykmWL8KvkqCnT7wbaPE3YVBCJqGs7MxBj9YsojqRH9jTHELw7w3eKydhP7PuSNHMwQMvdnk6NLuFwq5PH7vK2v5B9R6ett7kSZHywf6bMFxjjrgSic3KgkQVS7DgSuXnRF7fjf55JmUWwZEwDnRgJ9jdyu6KMMza6iw7yMWnDiFPPxGztxQ";
+    if (!CROSSMINT_API_KEY) {
+      throw new Error("CROSSMINT_API_KEY not set in environment variables");
+    }
+
+    try {
+      console.log(`Sending transaction to Crossmint for wallet: ${walletAddress}`);
+      const response = await fetch(
+        `https://staging.crossmint.com/api/2022-06-09/wallets/${walletAddress}/transactions`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-API-KEY": CROSSMINT_API_KEY,
+          },
+          body: JSON.stringify({
+            params: {
+              transaction: serializedTransaction,
+              requiredSigners: [],
+            },
+          }),
+        }
+      );
+
+      console.log("response:", response);
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(
+          `Failed to send transaction to Crossmint: ${response.statusText}. Details: ${errorText}`
+        );
+      }
+
+      const data = await response.json();
+      console.log("Transaction sent to Crossmint successfully");
+      return data;
+    } catch (error) {
+      console.error("Error sending transaction to Crossmint:", error);
+      throw error;
+    }
+  }
+
+  async function validateAndBroadcast(
+    wrappedTxBase58: string,
+    approvals: Array<{ signer: string; signature: string }>,
+    lastValidBlockHeight: number
+  ): Promise<string> {
+    const transaction = VersionedTransaction.deserialize(bs58.decode(wrappedTxBase58));
+
+    console.log("📦 Analyzing wrapped transaction from Crossmint...");
+
+    // Check which signers are ACTUALLY required on-chain
+    const numRequiredSignatures = transaction.message.header.numRequiredSignatures;
+    const accountKeys = transaction.message.getAccountKeys();
+    const requiredSignerKeys = accountKeys.staticAccountKeys
+      .slice(0, numRequiredSignatures)
+      .map((pk) => pk.toBase58());
+
+    console.log("Required on-chain signers:", requiredSignerKeys);
+    console.log("Number of signatures needed:", numRequiredSignatures);
+
+    // Build signature map from approvals
+    const signaturesByPubkey: Record<string, string> = {};
+    for (const approval of approvals) {
+      const pubkey = approval.signer.split(":")[1];
+      signaturesByPubkey[pubkey] = approval.signature;
+      console.log(`Have signature for: ${pubkey}`);
+    }
+
+    // Use the existing transaction signatures (already includes Crossmint's signature)
+    // Just replace with our signatures where we have them
+
+    console.log("\n📝 Updating signatures...");
+    for (const approval of approvals) {
+      const pubkey = approval.signer.split(":")[1];
+      const signatureBytes = bs58.decode(approval.signature);
+
+      if (signatureBytes.length !== 64) {
+        throw new Error(`Invalid signature length for ${pubkey}: ${signatureBytes.length} bytes`);
+      }
+
+      // Find the index of this pubkey in requiredSignerKeys
+      const index = requiredSignerKeys.indexOf(pubkey);
+      if (index !== -1) {
+        transaction.signatures[index] = signatureBytes;
+        console.log(
+          `  Updated signature ${index + 1} for ${pubkey.slice(0, 8)}...${pubkey.slice(-8)}`
+        );
+      }
+    }
+
+    console.log("✅ All signatures attached");
+
+    // Broadcast
+    const connection = new Connection("https://api.devnet.solana.com", "confirmed");
+
+    // Note: We skip simulation because the Crossmint wrapped transaction
+    // expects the wallet to be funded, which Crossmint handles separately
+
+    // Broadcast
+    console.log("\n📡 Broadcasting transaction...");
+    const signature = await connection.sendRawTransaction(transaction.serialize(), {
+      skipPreflight: false,
+      maxRetries: 5,
+      preflightCommitment: "processed",
+    });
+
+    console.log("✅ Transaction sent!");
+    console.log("   Signature:", signature);
+    console.log("   Explorer: https://explorer.solana.com/tx/" + signature + "?cluster=devnet");
+
+    // Wait for confirmation
+    console.log("\n⏳ Waiting for confirmation...");
+    await connection.confirmTransaction(
+      {
+        signature,
+        blockhash: transaction.message.recentBlockhash,
+        lastValidBlockHeight,
+      },
+      "confirmed"
+    );
+
+    console.log("✅ Transaction confirmed!");
+
+    return signature;
+  }
+
   async function handleSend() {
     setError(null);
     setIsLoading(true);
@@ -90,35 +218,62 @@ export function SendFundsModal({ open, onClose }: SendFundsModalProps) {
         return;
       }
 
+      console.log("solanaWallet.address:", wallet.address);
+
       const nativeTransferInstruction = SystemProgram.transfer({
-        fromPubkey: new PublicKey("4JK7UiAuNvabjVCjLu4SjkgLv7ExETsyAX9imvBA6tQM"),
+        fromPubkey: new PublicKey(solanaWallet.address),
         toPubkey: new PublicKey(recipient),
         lamports: Number(0.0001) * LAMPORTS_PER_SOL,
       });
 
       const recentBlockhash = await connection.getLatestBlockhash();
 
+      console.log("recentBlockhash:", recentBlockhash);
+
       const msg = new TransactionMessage({
-        payerKey: new PublicKey("4JK7UiAuNvabjVCjLu4SjkgLv7ExETsyAX9imvBA6tQM"),
+        payerKey: new PublicKey(solanaWallet.address),
         recentBlockhash: recentBlockhash.blockhash,
         instructions: [nativeTransferInstruction],
       }).compileToV0Message();
 
       const transaction = new VersionedTransaction(msg);
 
-      const serializedTx = bs58.encode(transaction.serialize());
-
-      const { signature } = await solanaWallet.signer.signTransaction(serializedTx);
-
-      const signatureBytes = bs58.decode(signature as string);
-
-      transaction.addSignature(new PublicKey(solanaWallet.address), signatureBytes);
-
       console.log("transaction:", transaction);
-      const sig = await connection.sendRawTransaction(transaction.serialize(), { maxRetries: 3 });
 
-      console.log("sig:", sig);
-      refetchBalance();
+      const serializedTx = bs58.encode(transaction.serialize());
+      console.log("serializedTx:", serializedTx);
+
+      const { transactionId } = await solanaWallet.sendTransaction({
+        transaction: transaction,
+        options: { experimental_prepareOnly: true },
+      });
+
+      const txDetails = await solanaWallet.experimental_transaction(transactionId);
+      console.log("Transaction ID:", transactionId);
+
+      console.log("On-chain transaction:", txDetails.onChain.transaction);
+
+      const vtx = VersionedTransaction.deserialize(bs58.decode(txDetails.onChain.transaction));
+      console.log("vtx:", vtx);
+
+      const lvbh = txDetails.onChain.lastValidBlockHeight;
+      console.log("Pending approvals:", txDetails.approvals.pending);
+
+      const { signature } = await solanaWallet.signer.signTransaction(
+        txDetails.onChain.transaction
+      );
+
+      const sig = [
+        {
+          signer: "AVsGgtpNfpncBHwBePY81SPVredLmaoHRWq3Vn8EMJ3C",
+          signature: signature as string,
+        },
+      ];
+
+      console.log("Email signature:", signature);
+
+      await validateAndBroadcast(txDetails.onChain.transaction, sig, lvbh);
+      // console.log("sig:", sig);
       refetchActivityFeed();
       // handleDone();
     } catch (err: any) {
