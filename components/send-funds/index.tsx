@@ -102,7 +102,7 @@ export function SendFundsModal({ open, onClose }: SendFundsModalProps) {
 
     console.log("\n📝 Updating signatures...");
     for (const approval of approvals) {
-      const pubkey = approval.signer.split(":")[1];
+      const pubkey = approval.signer;
       const signatureBytes = bs58.decode(approval.signature);
 
       if (signatureBytes.length !== 64) {
@@ -159,11 +159,7 @@ export function SendFundsModal({ open, onClose }: SendFundsModalProps) {
     setError(null);
     setIsLoading(true);
     try {
-      if (!isRecipientValid || !amount || !isAmountValid) {
-        setError("Invalid recipient or amount");
-        setIsLoading(false);
-        return;
-      }
+    
 
       if (!wallet) {
         setError("No wallet connected");
@@ -173,10 +169,33 @@ export function SendFundsModal({ open, onClose }: SendFundsModalProps) {
 
       console.log("solanaWallet.address:", wallet.address);
 
+      // Validate recipient PublicKey
+      let recipientPubkey: PublicKey;
+      try {
+        recipientPubkey = new PublicKey(recipient);
+      } catch {
+        setError("Invalid recipient address");
+        setIsLoading(false);
+        return;
+      }
+
+      // Compute lamports from input amount (in SOL)
+      const lamports = Math.round(parseFloat(amount || "0") * LAMPORTS_PER_SOL);
+
+      // Pre-check balance for amount + fees buffer
+      const balance = await connection.getBalance(new PublicKey(solanaWallet.address));
+      console.log("balance:", balance);
+      console.log("lamports:", lamports);
+      if (balance < lamports + 200_000) {
+        setError("Insufficient SOL for amount + fees");
+        setIsLoading(false);
+        return;
+      }
+
       const nativeTransferInstruction = SystemProgram.transfer({
         fromPubkey: new PublicKey(solanaWallet.address),
-        toPubkey: new PublicKey(recipient),
-        lamports: Number(0.0001) * LAMPORTS_PER_SOL,
+        toPubkey: recipientPubkey,
+        lamports,
       });
 
       const recentBlockhash = await connection.getLatestBlockhash();
@@ -204,28 +223,39 @@ export function SendFundsModal({ open, onClose }: SendFundsModalProps) {
       const txDetails = await solanaWallet.experimental_transaction(transactionId);
       console.log("Transaction ID:", transactionId);
 
-      console.log("On-chain transaction:", txDetails.onChain.transaction);
+      const onChainTransaction = (txDetails.onChain as any).transaction;
+      console.log("On-chain transaction:", onChainTransaction);
 
-      const vtx = VersionedTransaction.deserialize(bs58.decode(txDetails.onChain.transaction));
+      const vtx = VersionedTransaction.deserialize(bs58.decode(onChainTransaction));
       console.log("vtx:", vtx);
 
-      const lvbh = txDetails.onChain.lastValidBlockHeight;
-      console.log("Pending approvals:", txDetails.approvals.pending);
+      const lvbh = recentBlockhash.lastValidBlockHeight;
 
+      console.log("Pending approvals:", txDetails.approvals?.pending);
+
+
+//you need to do this following part for each of the signers returned in the pending approvals array
       const { signature } = await solanaWallet.signer.signTransaction(
-        txDetails.onChain.transaction
+        onChainTransaction
       );
 
+      const { numRequiredSignatures } = vtx.message.header;
+      const requiredSignerKeys = vtx.message
+        .getAccountKeys()
+        .staticAccountKeys
+        .slice(0, numRequiredSignatures)
+        .map((k) => k.toBase58());
+      const requiredSigner = requiredSignerKeys[1] ?? requiredSignerKeys[0]; // always skip the first onchain signer as it will be crossmint internal signer 
       const sig = [
         {
-          signer: solanaWallet.address,
+          signer: requiredSigner,
           signature: signature as string,
         },
       ];
 
       console.log("Email signature:", signature);
 
-      await validateAndBroadcast(txDetails.onChain.transaction, sig, lvbh);
+      await validateAndBroadcast(onChainTransaction, sig, lvbh);
       // console.log("sig:", sig);
       refetchActivityFeed();
       // handleDone();
